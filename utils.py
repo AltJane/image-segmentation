@@ -1,13 +1,18 @@
 import os
 import re
 import sys
+from pathlib import Path
+from typing import Optional, Callable, Any
+
 import torch
 import numpy as np
 from PIL import Image
 from torch import Tensor
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import warnings
+from torchvision import transforms
+from torchvision.datasets import VisionDataset
 
 warnings.filterwarnings("ignore")
 
@@ -120,9 +125,10 @@ class BasicDataset(Dataset):
         mask = load_image(mask_file)
         img = load_image(img_file)
 
-        img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
-        mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
-        return torch.as_tensor(img.copy()).float().contiguous(), torch.as_tensor(mask.copy()).long().contiguous()
+        # img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
+        # mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
+        return torch.as_tensor(np.asarray(img).copy()).float().contiguous(), torch.as_tensor(
+            np.asarray(mask).copy()).long().contiguous()
 
 
 def dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: bool = False, epsilon: float = 1e-6):
@@ -156,3 +162,67 @@ def count_dice_coeff_torchvision(val_loader, net):
         mask_true = F.one_hot(mask_true, 13).permute(0, 3, 1, 2).float()
         mask_pred = F.one_hot(mask_pred.argmax(dim=1), 13).permute(0, 3, 1, 2).float()
         dice_score += multiclass_dice_coeff(mask_pred[:, 1:], mask_true[:, 1:], reduce_batch_first=False)
+
+
+class SegmentationDataset(VisionDataset):
+    def __init__(self,
+                 root: str,
+                 image_folder: str = "archive",
+                 mask_folder: str = "archive",
+                 transforms: Optional[Callable] = None,
+                 image_color_mode: str = "rgb",
+                 mask_color_mode: str = "grayscale") -> None:
+
+        super().__init__(root, transforms)
+        self.image_names = find_images_in_directory(image_folder, original_img_regex)
+        self.mask_names = [f"{x}_watershed_mask" for x in self.image_names]
+        self.image_color_mode = image_color_mode
+        self.mask_color_mode = mask_color_mode
+        print("self.image_names[:10]", self.image_names[:10])
+
+    def __len__(self) -> int:
+        return len(self.image_names)
+
+    def __getitem__(self, index: int) -> Any:
+        image_path = self.image_names[index]
+        mask_path = self.mask_names[index]
+        with open(f"archive/{image_path}.png", "rb") as image_file, open(f"archive/{mask_path}.png", "rb") as mask_file:
+            image = Image.open(image_file)
+            if self.image_color_mode == "rgb":
+                image = image.convert("RGB")
+            elif self.image_color_mode == "grayscale":
+                image = image.convert("L")
+            mask = Image.open(mask_file)
+            if self.mask_color_mode == "rgb":
+                mask = mask.convert("RGB")
+            elif self.mask_color_mode == "grayscale":
+                mask = mask.convert("L")
+            sample = {"image": image, "mask": mask}
+            if self.transforms:
+                sample["image"] = self.transforms(sample["image"])
+                sample["mask"] = self.transforms(sample["mask"])
+            return sample
+
+
+def get_dataloader_single_folder(data_dir: str,
+                                 image_folder: str = 'archive',
+                                 mask_folder: str = 'archive',
+                                 fraction: float = 0.2,
+                                 batch_size: int = 4):
+    data_transforms = transforms.Compose([transforms.ToTensor()])
+
+    image_datasets = {
+        x: SegmentationDataset(data_dir,
+                               image_folder=image_folder,
+                               mask_folder=mask_folder,
+                               transforms=data_transforms)
+        for x in ['Train', 'Test']
+    }
+    dataloaders = {
+        x: DataLoader(image_datasets[x],
+                      batch_size=batch_size,
+                      shuffle=True,
+                      num_workers=8)
+        for x in ['Train', 'Test']
+    }
+    return dataloaders
